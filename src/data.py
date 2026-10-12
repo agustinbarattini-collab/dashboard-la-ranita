@@ -630,3 +630,103 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         )
 
     return items
+
+
+TAB_INDIRECTOS = "Indirectos"
+GID_INDIRECTOS = 1046227083
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando pestaña Indirectos...")
+def load_indirectos_config() -> pd.DataFrame:
+    """Pestana "Indirectos": por cada codigo `presup` (arren, sueld, ...) su
+    detalle, un factor "Gestion" (proporcion del importe que se imputa a la
+    gestion; ej. ganancias = 0) y el % que se asigna a cada area (Maquinaria,
+    Gerenciamiento, estructura, ...). Fila 1 = nombres de area desde la
+    columna D; fila 2 = encabezados; datos desde la fila 3. Devuelve formato
+    largo: una fila por codigo x area."""
+    ws = _get_client().open_by_key(SPREADSHEET_ID).worksheet(TAB_INDIRECTOS)
+    values = ws.get_values(value_render_option="UNFORMATTED_VALUE")
+    cabecera = [str(c).strip() for c in values[0]]
+    areas = [(j, c[:1].upper() + c[1:]) for j, c in enumerate(cabecera) if j >= 3 and c and c.lower() != "total"]
+    ancho = len(cabecera)
+    filas = []
+    for r in values[2:]:
+        r = list(r) + [""] * (ancho - len(r))
+        codigo = str(r[0]).strip().lower()
+        if not codigo:
+            continue
+        factor = _parse_numero_uno(r[2])
+        factor = 0.0 if pd.isna(factor) else factor
+        for j, area in areas:
+            pct = _parse_numero_uno(r[j])
+            filas.append(
+                {
+                    "Codigo": codigo,
+                    "Detalle": str(r[1]).strip(),
+                    "Factor gestión": factor,
+                    "Área": area,
+                    "Pct": 0.0 if pd.isna(pct) else pct,
+                }
+            )
+    return pd.DataFrame(filas, columns=["Codigo", "Detalle", "Factor gestión", "Área", "Pct"])
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando indirectos...")
+def load_indirectos_df() -> pd.DataFrame:
+    """Filas de "Actual" cuyo Produc/labor es "indirecto" (en cualquier
+    Bloque: PRES IND y Ganaderia), con el codigo `presup` normalizado."""
+    ws = _get_client().open_by_key(SPREADSHEET_ID).worksheet(TAB_NAME)
+    df = pd.DataFrame(ws.get_all_records(value_render_option="UNFORMATTED_VALUE"))
+    df.columns = df.columns.str.strip()
+    df = df[df["Produc/labor"].astype(str).str.strip().str.lower() == "indirecto"].copy()
+    df["Gestion"] = df["Gestion"].astype(str).str.strip()
+    df["Codigo"] = df["presup"].astype(str).str.strip().str.lower()
+    df["RealPresup"] = df["real/presup"].astype(str).str.strip()
+    df["Clase"] = df["Gtos/Ingr/Ret/Inv"].astype(str).str.strip()
+    df["Bloque_norm"] = df["Bloque"].astype(str).str.strip().str.upper()
+    df["Costo U$"] = _parse_numero_ar(df["U$ tot sin IVA"])
+    df["Costo $"] = _parse_numero_ar(df["$ total"])
+    return df.reset_index(drop=True)
+
+
+def asignar_indirectos(
+    ind: pd.DataFrame,
+    config: pd.DataFrame,
+    moneda: str = "U$",
+    incluir: tuple[str, ...] = ("realiz", "presup"),
+    aplicar_factor: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, float]:
+    """Reparte los indirectos entre las areas segun la pestana Indirectos:
+    Imputado = Importe del codigo x Factor gestion x % del area.
+
+    Solo se asignan filas de clase Gtos cuyo codigo esta en la pestana y
+    tiene algun % de area; el resto (codigos que no estan en la pestana,
+    como los sem*, ganaderia, retiros o inversiones, o clases Ing/Ret/Inv)
+    queda en `no_asignado` con el motivo. Devuelve (asignado, no_asignado,
+    importe total de las filas consideradas)."""
+    col = "Costo U$" if moneda == "U$" else "Costo $"
+    base = ind[ind["RealPresup"].isin(incluir)]
+    cfg_pct = config[config["Pct"] > 0]
+    codigos_cfg = set(config["Codigo"])
+    codigos_con_pct = set(cfg_pct["Codigo"])
+    asignable = base["Codigo"].isin(codigos_con_pct) & (base["Clase"] == "Gtos")
+
+    suma = (
+        base[asignable].groupby(["Gestion", "Codigo"], as_index=False)[col].sum().rename(columns={col: "Importe"})
+    )
+    asig = suma.merge(cfg_pct, on="Codigo")
+    asig["Factor"] = asig["Factor gestión"] if aplicar_factor else 1.0
+    asig["Imputado"] = asig["Importe"] * asig["Factor"] * asig["Pct"]
+
+    resto = base[~asignable].copy()
+    resto["Motivo"] = np.select(
+        [~resto["Codigo"].isin(codigos_cfg), ~resto["Codigo"].isin(codigos_con_pct)],
+        ["Código no está en la pestaña Indirectos", "Sin % de área en la pestaña Indirectos"],
+        default="Clase " + resto["Clase"] + " (solo se asignan Gtos)",
+    )
+    no_asig = (
+        resto.groupby(["Gestion", "Codigo", "Clase", "Motivo"], as_index=False)
+        .agg(Filas=(col, "size"), Importe=(col, "sum"))
+        .sort_values(["Gestion", "Importe"], ascending=[True, False])
+    )
+    return asig, no_asig, float(base[col].sum())

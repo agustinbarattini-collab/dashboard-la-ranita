@@ -74,7 +74,7 @@ st.set_page_config(page_title="La Ranita · Dashboard", layout="wide", page_icon
 auth.require_login()
 
 st.sidebar.title("🐸 La Ranita")
-seccion = st.sidebar.radio("Sección", ["1. Costos", "2. Resultado", "3. Revisión de datos"])
+seccion = st.sidebar.radio("Sección", ["1. Costos", "2. Resultado", "3. Indirectos", "4. Revisión de datos"])
 
 if st.sidebar.button("↻ Actualizar datos"):
     st.cache_data.clear()
@@ -514,7 +514,152 @@ elif seccion == "2. Resultado":
             "cosechada (no es un promedio simple entre cultivos)."
         )
 
-elif seccion == "3. Revisión de datos":
+elif seccion == "3. Indirectos":
+    st.title("Indirectos")
+    st.caption(
+        "Filas de la base con Produc/labor = \"indirecto\" (bloques PRES IND y Ganadería), "
+        "asignadas a cada área según la pestaña \"Indirectos\" de la planilla: cada código "
+        "(columna `presup`: arren, sueld, combu, ...) tiene un factor \"Gestion\" y un % por "
+        "área. Importe imputado = importe del código × factor Gestión × % del área. Usa el "
+        "filtro de Campaña y la Moneda de la izquierda."
+    )
+
+    config_ind = data.load_indirectos_config()
+    ind = data.load_indirectos_df()
+    areas = list(dict.fromkeys(config_ind["Área"]))
+
+    st.link_button(
+        "✏️ Editar la pestaña Indirectos en la planilla",
+        f"https://docs.google.com/spreadsheets/d/{data.SPREADSHEET_ID}/edit#gid={data.GID_INDIRECTOS}",
+    )
+    with st.expander("Ver la tabla de asignación que se está usando"):
+        ancho = (
+            config_ind.pivot_table(index=["Codigo", "Detalle", "Factor gestión"], columns="Área", values="Pct", aggfunc="sum")
+            .reindex(columns=areas)
+            .reset_index()
+            .rename(columns={"Codigo": "Código"})
+        )
+        pct_vacio = lambda v: "" if pd.isna(v) or v == 0 else f"{v:.0%}"
+        st.dataframe(
+            ancho.style.format({c: pct_vacio for c in ["Factor gestión"] + areas}),
+            use_container_width=True,
+            hide_index=True,
+            height=altura_tabla(min(len(ancho), 15)),
+        )
+        st.caption(
+            "Se lee en vivo de la pestaña Indirectos: si cambiás un % o un factor en la planilla, "
+            "apretá \"↻ Actualizar datos\" (a la izquierda) y se recalcula; si no, se refresca "
+            "sola cada 10 minutos."
+        )
+
+    col_a, col_b = st.columns([2, 1])
+    modo_rp = col_a.radio(
+        "Importes a considerar",
+        ["Real + presupuestado", "Solo real", "Solo presupuestado"],
+        horizontal=True,
+        help="En 26/27 el real cubre los meses ya ejecutados y el presupuesto los que faltan.",
+    )
+    aplicar_factor = col_b.toggle(
+        "Aplicar factor \"Gestion\"",
+        value=True,
+        help="Multiplica cada código por su factor de la pestaña Indirectos (ej. ganancias = 0, "
+        "gastos bancarios = 0,9). Apagalo para ver los importes sin ese ajuste.",
+    )
+    incluir = {
+        "Real + presupuestado": ("realiz", "presup"),
+        "Solo real": ("realiz",),
+        "Solo presupuestado": ("presup",),
+    }[modo_rp]
+
+    ind_f = ind[ind["Gestion"].isin(gestiones_sel)]
+    asig, no_asig, total_filas = data.asignar_indirectos(ind_f, config_ind, moneda, incluir, aplicar_factor)
+
+    campanas = [g for g in gestiones_sel if g in set(ind_f["Gestion"])]
+    imputado = asig["Imputado"].sum()
+    sin_asignar = no_asig["Importe"].sum()
+    excluido_factor = total_filas - imputado - sin_asignar
+    if abs(excluido_factor) < 0.5:
+        excluido_factor = 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(f"Total filas indirecto ({moneda})", f"{total_filas:,.0f}")
+    c2.metric("Imputado a áreas", f"{imputado:,.0f}")
+    c3.metric("Excluido por factor Gestión", f"{excluido_factor:,.0f}")
+    c4.metric("Sin asignar", f"{sin_asignar:,.0f}")
+    st.caption("Total filas = imputado + excluido por factor + sin asignar.")
+
+    if asig.empty:
+        st.info("No hay indirectos asignables para el filtro actual.")
+    else:
+        def _formato_importes(tabla: pd.DataFrame, cols: list[str]):
+            return tabla.style.format({c: "{:,.0f}" for c in cols}, na_rep="—")
+
+        st.subheader(f"Resumen por área y campaña ({moneda})")
+        resumen = (
+            asig.pivot_table(index="Área", columns="Gestion", values="Imputado", aggfunc="sum")
+            .reindex(index=areas, columns=campanas)
+            .fillna(0.0)
+        )
+        if len(campanas) > 1:
+            resumen["Total"] = resumen.sum(axis=1)
+        resumen.loc["TOTAL"] = resumen.sum(axis=0)
+        resumen = resumen.reset_index()
+
+        def _resaltar_total(row: pd.Series) -> list[str]:
+            return ["font-weight: bold; background-color: #e0e0e0"] * len(row) if row["Área"] == "TOTAL" else [""] * len(row)
+
+        st.dataframe(
+            _formato_importes(resumen, [c for c in resumen.columns if c != "Área"]).apply(_resaltar_total, axis=1),
+            use_container_width=True,
+            hide_index=True,
+            height=altura_tabla(len(resumen)),
+        )
+
+        st.subheader(f"Detalle por área ({moneda})")
+        st.caption(
+            "Hacé clic en un área para ver qué códigos la componen. \"% al área\" es el porcentaje "
+            "de cada código que va a esa área según la pestaña Indirectos; \"Factor\" es el factor "
+            "Gestión del código."
+        )
+        for area in areas:
+            sub = asig[asig["Área"] == area]
+            total_area = sub["Imputado"].sum()
+            with st.expander(f"{area} — {total_area:,.0f}"):
+                if sub.empty:
+                    st.write("Ningún código tiene % asignado a esta área.")
+                    continue
+                det = sub.pivot_table(
+                    index=["Detalle", "Codigo", "Pct", "Factor"], columns="Gestion", values="Imputado", aggfunc="sum"
+                ).reindex(columns=campanas).fillna(0.0)
+                if len(campanas) > 1:
+                    det["Total"] = det.sum(axis=1)
+                det = det.reset_index().rename(columns={"Pct": "% al área", "Codigo": "Código"})
+                det = det.sort_values(det.columns[-1], key=lambda s: s.abs(), ascending=False)
+                importes = [c for c in det.columns if c not in ("Detalle", "Código", "% al área", "Factor")]
+                st.dataframe(
+                    det.style.format({**{c: "{:,.0f}" for c in importes}, "% al área": "{:.0%}", "Factor": "{:.2f}"}, na_rep="—"),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=altura_tabla(min(len(det), 15)),
+                )
+
+    st.subheader(f"Sin asignar ({moneda})")
+    st.caption(
+        "Filas \"indirecto\" que no se pudieron repartir: el código no está en la pestaña "
+        "Indirectos (ej. los sem*, ganadería, retiros, inversiones) o la fila no es de clase Gtos "
+        "(Ing/Ret/Inv). Para asignarlas, agregá el código con sus % en la pestaña Indirectos."
+    )
+    if no_asig.empty:
+        st.write("Todas las filas indirecto quedaron asignadas.")
+    else:
+        st.dataframe(
+            no_asig.rename(columns={"Codigo": "Código", "Gestion": "Campaña"}).style.format({"Importe": "{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+            height=altura_tabla(min(len(no_asig), 12)),
+        )
+
+elif seccion == "4. Revisión de datos":
     st.title("Revisión de datos")
     st.caption(
         "Chequeos automáticos sobre las pestañas Actual y Comercial de la planilla, para "
