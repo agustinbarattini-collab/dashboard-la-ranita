@@ -1,5 +1,5 @@
 streamlit
 gspread
 google-auth
-pandas>=2.3.6
+pandas>=2.3.7
 plotly
