@@ -73,7 +73,7 @@ st.set_page_config(page_title="La Ranita · Dashboard", layout="wide", page_icon
 auth.require_login()
 
 st.sidebar.title("🐸 La Ranita")
-seccion = st.sidebar.radio("Sección", ["1. Costos", "2. Resultado"])
+seccion = st.sidebar.radio("Sección", ["1. Costos", "2. Resultado", "3. Revisión de datos"])
 
 if st.sidebar.button("↻ Actualizar datos"):
     st.cache_data.clear()
@@ -198,13 +198,16 @@ if seccion == "1. Costos":
         )
         st.plotly_chart(fig_tipo, use_container_width=True)
 
-    st.subheader(f"Costo/ha sembrada por lote, desglosado por Tipo ({moneda}/ha)")
+    st.subheader(f"Costo/ha por lote, desglosado por Tipo ({moneda}/ha)")
     st.caption(
         "Un heatmap por cultivo (hacé clic para abrirlo): filas = lote, columnas = Tipo de "
         "gasto + una columna final \"Total\" (todos los Tipo sumados, el costo/ha completo "
-        "de ese lote). El promedio ponderado y el color comparan cada lote contra el "
-        "promedio de ESE cultivo únicamente (no contra los demás cultivos) — para ver si el "
-        "desvío viene de un tipo de gasto puntual en un lote."
+        "de ese lote). Si un lote tiene 2 cultivos en la misma campaña, el gasto de cada "
+        "cultivo se divide por la superficie de ESE cultivo en el lote (hectáreas "
+        "cosechadas; si todavía no hay cosecha cargada, las sembradas). El promedio "
+        "ponderado y el color comparan cada lote contra el promedio de ESE cultivo "
+        "únicamente (no contra los demás cultivos) — para ver si el desvío viene de un tipo "
+        "de gasto puntual en un lote."
     )
     crudo_tipo = data.costo_por_tipo_y_lote(df_costo, moneda)
     if crudo_tipo.empty:
@@ -509,3 +512,40 @@ elif seccion == "2. Resultado":
             "Margen Neto / Ingreso Neto. \"General\" pondera todos los cultivos por hectárea "
             "cosechada (no es un promedio simple entre cultivos)."
         )
+
+elif seccion == "3. Revisión de datos":
+    st.title("Revisión de datos")
+    st.caption(
+        "Chequeos automáticos sobre las pestañas Actual y Comercial de la planilla, para "
+        "detectar posibles errores de carga. Se recalculan con cada actualización de datos y "
+        "no usan los filtros de la izquierda. ⚠️ = probable error a revisar, ℹ️ = algo que el "
+        "dashboard ya interpreta pero conviene conocer, ✅ = sin hallazgos."
+    )
+
+    items = data.revisiones(df, data.load_comercial_df())
+    n_revisar = sum(1 for it in items if it["nivel"] == "Revisar" and len(it["tabla"]))
+    n_info = sum(1 for it in items if it["nivel"] == "Info" and len(it["tabla"]))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("⚠️ Para revisar", n_revisar)
+    c2.metric("ℹ️ Informativos", n_info)
+    c3.metric("✅ Sin hallazgos", sum(1 for it in items if not len(it["tabla"])))
+
+    def _orden_revision(it: dict) -> int:
+        if not len(it["tabla"]):
+            return 2
+        return 0 if it["nivel"] == "Revisar" else 1
+
+    for it in sorted(items, key=_orden_revision):
+        n = len(it["tabla"])
+        icono = "✅" if n == 0 else ("⚠️" if it["nivel"] == "Revisar" else "ℹ️")
+        with st.expander(f"{icono} {it['titulo']} ({n})"):
+            st.caption(it["detalle"].replace("$", "\\$"))
+            if n:
+                st.dataframe(
+                    it["tabla"],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=altura_tabla(min(n, 12)),
+                )
+            else:
+                st.write("Sin hallazgos.")

@@ -148,51 +148,56 @@ def costo_por_tipo(df: pd.DataFrame, moneda: str = "U$") -> pd.DataFrame:
     )
 
 
-def costo_por_ha(df: pd.DataFrame, by: list[str] = ("Gestion", "Cultivo"), moneda: str = "U$") -> pd.DataFrame:
-    """Costo por hectarea SEMBRADA, ponderado por superficie: sum(costo) /
-    sum(Sup), agrupando por lote+cultivo primero para no duplicar la
-    superficie de un mismo lote entre varias filas de insumos/labores."""
-    col = "Costo U$" if moneda == "U$" else "Costo $"
-    por_lote = (
-        df.groupby(list(by) + ["Bloque_norm"], as_index=False)
-        .agg(_costo=(col, "sum"), _sup=("Sup", "max"))
-    )
-    grouped = por_lote.groupby(list(by), as_index=False).agg(
-        _costo=("_costo", "sum"), _sup=("_sup", "sum")
-    )
-    grouped[f"Costo/ha ({moneda})"] = grouped["_costo"] / grouped["_sup"]
-    return grouped.drop(columns=["_costo", "_sup"])
+def superficie_cultivo_lote(df: pd.DataFrame) -> pd.DataFrame:
+    """Superficie propia de cada cultivo dentro de cada lote y campana
+    (Gestion, Bloque, Cultivo). Un mismo lote puede tener 2 cultivos en la
+    misma campana (ej. Girasol y Soja en 2A1 25/26, o Trigo y Soja 2ª), y
+    cada fila de insumo/labor trae en Sup/cant solo la superficie de ESA
+    pasada (herbicidas de barbecho pueden cubrir mas hectareas que las
+    realmente sembradas con el cultivo), asi que tomar el Sup maximo del
+    grupo sobreestima la superficie del cultivo y subestima su costo/ha.
+
+    Prioridad: 1) suma de Sup en filas Cosecha (real+presupuestada, mismo
+    criterio que superficie_cosechada); 2) si el cultivo no tiene Cosecha
+    cargada, suma de Sup en filas Siembra; 3) si tampoco, el Sup maximo del
+    grupo (pasturas/verdeos sin siembra ni cosecha)."""
+    det = detalle_superficie_cultivo_lote(df)
+    return det[["Gestion", "Bloque", "Cultivo", "Superficie"]].rename(columns={"Superficie": "Sup"})
 
 
-def costo_y_sup_por_lote(df: pd.DataFrame, moneda: str = "U$") -> pd.DataFrame:
-    """Costo total y superficie SEMBRADA crudos, uno por (Bloque, Cultivo)
-    sin agregar entre lotes (a diferencia de costo_por_ha, que suma todos
-    los lotes de un cultivo). Se devuelven ambos componentes por separado
-    (no ya divididos) para poder calcular despues un promedio ponderado
-    por columna (sum(Costo)/sum(Sup)) en vez de solo el ratio por lote."""
-    col = "Costo U$" if moneda == "U$" else "Costo $"
-    por_lote = df.groupby(["Bloque_norm", "Cultivo"], as_index=False).agg(
-        Costo=(col, "sum"), Sup=("Sup", "max")
+def detalle_superficie_cultivo_lote(df: pd.DataFrame) -> pd.DataFrame:
+    """Mismo calculo que superficie_cultivo_lote pero mostrando las 3
+    candidatas (Cosecha, Siembra, Sup max), la elegida y su Fuente."""
+    keys = ["Gestion", "Bloque_norm", "Cultivo"]
+    maximo = df.groupby(keys)["Sup"].max()
+    det = pd.DataFrame(
+        {
+            "Cosecha": df[df["Tipo_norm"] == "COSECHA"].groupby(keys)["Sup"].sum().reindex(maximo.index),
+            "Siembra": df[df["Tipo_norm"] == "SIEMBRA"].groupby(keys)["Sup"].sum().reindex(maximo.index),
+            "Sup máx": maximo,
+        }
     )
-    return por_lote.rename(columns={"Bloque_norm": "Bloque"})
+    cos_ok = det["Cosecha"].where(det["Cosecha"] > 0)
+    sie_ok = det["Siembra"].where(det["Siembra"] > 0)
+    det["Superficie"] = cos_ok.fillna(sie_ok).fillna(det["Sup máx"])
+    det["Fuente"] = np.where(cos_ok.notna(), "Cosecha", np.where(sie_ok.notna(), "Siembra", "Sup máx"))
+    return det.reset_index().rename(columns={"Bloque_norm": "Bloque"})
 
 
 def costo_por_tipo_y_lote(df: pd.DataFrame, moneda: str = "U$") -> pd.DataFrame:
-    """Costo total y superficie sembrada por (Bloque, Cultivo, Tipo), para
+    """Costo total y superficie por (Bloque, Cultivo, Tipo), para
     desglosar el costo/ha de cada lote+cultivo por tipo de gasto. La
-    superficie es la misma para todos los Tipo de un mismo lote+cultivo
-    (viene de Sup/cant, constante en todas sus filas de insumos/labores)."""
+    superficie es la misma para todos los Tipo de un mismo lote+cultivo y
+    es la propia de ese cultivo en ese lote (ver superficie_cultivo_lote).
+    Si hay varias campanas seleccionadas, el costo y la superficie se
+    suman entre campanas (cada campana usa su propia superficie)."""
     col = "Costo U$" if moneda == "U$" else "Costo $"
     costo = (
         df.groupby(["Bloque_norm", "Cultivo", "Tipo"], as_index=False)[col]
         .sum()
         .rename(columns={"Bloque_norm": "Bloque", col: "Costo"})
     )
-    sup = (
-        df.groupby(["Bloque_norm", "Cultivo"], as_index=False)["Sup"]
-        .max()
-        .rename(columns={"Bloque_norm": "Bloque"})
-    )
+    sup = superficie_cultivo_lote(df).groupby(["Bloque", "Cultivo"], as_index=False)["Sup"].sum()
     return costo.merge(sup, on=["Bloque", "Cultivo"], how="left")
 
 
@@ -311,3 +316,232 @@ def comercial_lookup(df_comercial: pd.DataFrame) -> dict[tuple[str, str, str], f
     return {
         (r.Gestion, r.Cultivo, r.Metrica): r.Valor for r in df_comercial.itertuples(index=False)
     }
+
+
+# Umbrales de los chequeos de revision (ajustables si dan demasiado ruido).
+UMBRAL_SIEMBRA_VS_COSECHA = 0.15
+UMBRAL_COSTO_HA_LOTE = (0.5, 2.0)
+UMBRAL_COSTO_FILA = 5.0
+PISO_COSTO_FILA = 100.0
+UMBRAL_REAL_VS_PRESUP = 3.0
+UMBRAL_HAS_COMERCIAL = 0.02
+
+
+def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
+    """Chequeos de calidad de datos sobre la hoja Actual (ya sin los bloques
+    excluidos) y la pestana Comercial. Cada item es un dict con titulo,
+    detalle (que mirar / por que importa), nivel ("Revisar" = probable error
+    de carga; "Info" = algo que el calculo ya interpreta pero conviene
+    conocer) y tabla (DataFrame con lo encontrado; vacio = sin hallazgos)."""
+    items: list[dict] = []
+
+    def add(titulo: str, detalle: str, tabla: pd.DataFrame, nivel: str = "Revisar") -> None:
+        items.append({"titulo": titulo, "detalle": detalle, "nivel": nivel, "tabla": tabla.reset_index(drop=True)})
+
+    # 1. Nombres de cultivo que no estan en el diccionario
+    sin_mapa = df[~df["Cultivo_norm"].isin(CULTIVO_MAP)]
+    add(
+        "Cultivo con nombre no reconocido",
+        "El nombre no está en el diccionario de cultivos (o está vacío), así que aparece como "
+        "un cultivo aparte. Si es un error de tipeo, corregilo en la planilla; si es un cultivo "
+        "nuevo, hay que sumarlo al diccionario del dashboard.",
+        sin_mapa.groupby(["Cultivo_norm", "Gestion"], as_index=False).agg(
+            Filas=("Sup", "size"), Costo_U=("Costo U$", "sum")
+        ).rename(columns={"Cultivo_norm": "Cultivo (como está escrito)", "Costo_U": "Costo U$"}),
+    )
+
+    # 2. Filas sin Tipo
+    sin_tipo = df[df["Tipo"] == ""]
+    add(
+        "Filas sin Tipo de gasto",
+        "No entran en ninguna categoría del desglose por Tipo.",
+        sin_tipo[["Gestion", "Bloque_norm", "Cultivo", "Produc/labor", "Sup", "Costo U$"]],
+    )
+
+    # 3. Filas con Tipo pero sin costo
+    sin_costo = df[(df["Tipo"] != "") & df["Costo U$"].isna()]
+    add(
+        "Filas sin costo cargado",
+        "Tienen Tipo pero el costo (U$ tot sin IVA) está vacío: no suman nada al costo.",
+        sin_costo.groupby(["Gestion", "Bloque_norm", "Cultivo"], as_index=False).agg(Filas=("Tipo", "size")),
+    )
+
+    # 4/5. Superficie de cada cultivo en cada lote
+    det = detalle_superficie_cultivo_lote(df)
+    sin_cosecha = det[det["Fuente"] != "Cosecha"]
+    add(
+        "Lote + cultivo sin cosecha cargada",
+        "No tiene filas de Cosecha (ni real ni presupuestada), así que su costo/ha se divide por "
+        "la superficie sembrada o, si tampoco hay siembra, por la superficie máxima de sus filas. "
+        "Normal en pasturas/verdeos; en cultivos de grano conviene cargar la cosecha.",
+        sin_cosecha[["Gestion", "Bloque", "Cultivo", "Siembra", "Sup máx", "Superficie", "Fuente"]].round(1),
+        nivel="Info",
+    )
+
+    ambas = det[(det["Cosecha"] > 0) & (det["Siembra"] > 0)].copy()
+    ambas["Dif %"] = (ambas["Siembra"] - ambas["Cosecha"]) / ambas["Cosecha"] * 100
+    desvio = ambas[ambas["Dif %"].abs() > UMBRAL_SIEMBRA_VS_COSECHA * 100]
+    add(
+        "Siembra y cosecha no coinciden",
+        f"Hectáreas sembradas vs cosechadas del mismo lote + cultivo difieren más de "
+        f"{UMBRAL_SIEMBRA_VS_COSECHA:.0%}. Suele ser una siembra cargada dos veces, una resiembra, "
+        "o una cosecha incompleta. El dashboard usa las hectáreas de cosecha.",
+        desvio[["Gestion", "Bloque", "Cultivo", "Siembra", "Cosecha", "Dif %"]].round(1),
+    )
+
+    # 6. Cosecha con filas reales y presupuestadas a la vez
+    cos = df[df["Tipo_norm"] == "COSECHA"]
+    cos_rp = cos.pivot_table(
+        index=["Gestion", "Bloque_norm", "Cultivo"], columns="RealPresup", values="Sup", aggfunc="sum"
+    )
+    for col in ("realiz", "presup"):
+        if col not in cos_rp.columns:
+            cos_rp[col] = np.nan
+    mixto = cos_rp[(cos_rp["realiz"] > 0) & (cos_rp["presup"] > 0)].reset_index()
+    mixto["Suma usada (ha)"] = mixto["realiz"] + mixto["presup"]
+    add(
+        "Cosecha real y presupuestada a la vez",
+        "El dashboard suma real + presupuestada. Si la fila presupuestada ya incluye lo que se "
+        "cosechó (en vez de ser lo que falta), la superficie queda duplicada.",
+        mixto.rename(columns={"Bloque_norm": "Bloque", "realiz": "Real (ha)", "presup": "Presup (ha)"})[
+            ["Gestion", "Bloque", "Cultivo", "Real (ha)", "Presup (ha)", "Suma usada (ha)"]
+        ].round(1),
+    )
+
+    # 7. Lotes con 2+ cultivos en la misma campana
+    multi = det.groupby(["Gestion", "Bloque"]).filter(lambda g: len(g) > 1)
+    resumen = (
+        multi.assign(txt=multi["Cultivo"] + ": " + multi["Superficie"].round(1).astype(str) + " ha")
+        .groupby(["Gestion", "Bloque"], as_index=False)["txt"]
+        .agg(" · ".join)
+        .rename(columns={"txt": "Cultivos y superficie usada"})
+    )
+    add(
+        "Lotes con 2 cultivos en la misma campaña",
+        "El gasto de cada cultivo se divide por la superficie de ESE cultivo en el lote. Revisá "
+        "que cada fila de gasto esté cargada con el cultivo correcto.",
+        resumen,
+        nivel="Info",
+    )
+
+    # 8. Bloques que no parecen codigo de lote
+    raros = df[~df["Bloque_norm"].str.match(r"^\d")]
+    add(
+        "Lote con nombre que no parece un código de lote",
+        "Los lotes empiezan con un número (ej. 2A1, 7B2-7R2). Estos no: pueden ser un cultivo "
+        "o una nota cargada en la columna Bloque.",
+        raros.groupby(["Gestion", "Bloque_norm"], as_index=False).agg(
+            Filas=("Sup", "size"), Cultivos=("Cultivo", lambda s: ", ".join(sorted(set(s)))), Costo_U=("Costo U$", "sum")
+        ).rename(columns={"Bloque_norm": "Bloque", "Costo_U": "Costo U$"}).round(0),
+    )
+
+    # 9. Costo/ha de un lote muy distinto al de su cultivo
+    por_lote = df.groupby(["Gestion", "Bloque_norm", "Cultivo"], as_index=False)["Costo U$"].sum().rename(
+        columns={"Bloque_norm": "Bloque"}
+    )
+    por_lote = por_lote.merge(det[["Gestion", "Bloque", "Cultivo", "Superficie"]], on=["Gestion", "Bloque", "Cultivo"])
+    por_lote = por_lote[por_lote["Superficie"] > 0]
+    por_lote["Costo/ha"] = por_lote["Costo U$"] / por_lote["Superficie"]
+    mediana = por_lote.groupby(["Gestion", "Cultivo"])["Costo/ha"].transform("median")
+    n_lotes = por_lote.groupby(["Gestion", "Cultivo"])["Costo/ha"].transform("size")
+    por_lote["Mediana del cultivo"] = mediana
+    por_lote["Veces la mediana"] = por_lote["Costo/ha"] / mediana
+    bajo, alto = UMBRAL_COSTO_HA_LOTE
+    atipico = por_lote[(n_lotes >= 4) & ((por_lote["Veces la mediana"] > alto) | (por_lote["Veces la mediana"] < bajo))]
+    add(
+        "Costo/ha de un lote muy distinto al de su cultivo",
+        f"El costo/ha total del lote es más de {alto:g}x o menos de {bajo:g}x la mediana de su "
+        "cultivo en esa campaña (solo cultivos con 4+ lotes). Puede ser un lote parcial o un "
+        "error de carga (precio, cantidad o superficie).",
+        atipico[["Gestion", "Bloque", "Cultivo", "Costo U$", "Superficie", "Costo/ha", "Mediana del cultivo", "Veces la mediana"]].round(1),
+    )
+
+    # 10. Filas con costo/ha muy por encima de otras filas del mismo insumo/labor
+    filas = df[(df["Sup"] > 0) & df["Costo U$"].notna() & (df["Costo U$"] > 0)].copy()
+    filas["Producto"] = filas["Produc/labor"].astype(str).str.strip().str.lower()
+    filas["Costo U$/ha de la fila"] = filas["Costo U$"] / filas["Sup"]
+    g = filas.groupby(["Producto", "Tipo", "RealPresup"])["Costo U$/ha de la fila"]
+    filas["Mediana del producto"] = g.transform("median")
+    filas["Filas del producto"] = g.transform("size")
+    filas["Veces la mediana"] = filas["Costo U$/ha de la fila"] / filas["Mediana del producto"]
+    caras = filas[
+        (filas["Filas del producto"] >= 4)
+        & (filas["Veces la mediana"] > UMBRAL_COSTO_FILA)
+        & (filas["Costo U$"] >= PISO_COSTO_FILA)
+    ]
+    add(
+        "Fila con costo/ha muy por encima del mismo producto",
+        f"El costo por hectárea de esa fila supera {UMBRAL_COSTO_FILA:g}x la mediana de las demás "
+        "filas del mismo producto/labor y del mismo tipo (real con real, presupuesto con "
+        f"presupuesto; solo productos con 4+ filas y filas de U$ {PISO_COSTO_FILA:g} o más). "
+        "Típico de un precio unitario o una cantidad mal cargados.",
+        caras[["Gestion", "Bloque_norm", "Cultivo", "RealPresup", "Tipo", "Produc/labor", "Sup", "Costo U$", "Costo U$/ha de la fila", "Mediana del producto", "Veces la mediana"]]
+        .rename(columns={"Bloque_norm": "Bloque", "RealPresup": "Real/Presup"})
+        .sort_values("Veces la mediana", ascending=False)
+        .round(1),
+    )
+
+    # 10b. Mismo producto: costo/ha real muy distinto al presupuestado
+    med = filas.groupby(["Producto", "Tipo", "RealPresup"])["Costo U$/ha de la fila"].median().unstack("RealPresup")
+    cnt = filas.groupby(["Producto", "Tipo", "RealPresup"]).size().unstack("RealPresup")
+    if {"realiz", "presup"} <= set(med.columns):
+        rp = med[["realiz", "presup"]].join(cnt[["realiz", "presup"]], rsuffix="_n").dropna()
+        rp = rp[(rp["realiz_n"] >= 3) & (rp["presup_n"] >= 3) & (rp["realiz"] > 0) & (rp["presup"] > 0)]
+        rp["Presup / Real"] = rp["presup"] / rp["realiz"]
+        dist = rp[(rp["Presup / Real"] > UMBRAL_REAL_VS_PRESUP) | (rp["Presup / Real"] < 1 / UMBRAL_REAL_VS_PRESUP)]
+        tabla_rp = (
+            dist.reset_index()
+            .rename(columns={"realiz": "Real (U$/ha, mediana)", "presup": "Presup (U$/ha, mediana)", "realiz_n": "Filas real", "presup_n": "Filas presup"})
+            .sort_values("Presup / Real", ascending=False)
+            .round(2)
+        )
+    else:
+        tabla_rp = pd.DataFrame()
+    add(
+        "Mismo producto con costo/ha real muy distinto al presupuestado",
+        f"La mediana del costo/ha presupuestado es más de {UMBRAL_REAL_VS_PRESUP:g}x (o menos de "
+        f"1/{UMBRAL_REAL_VS_PRESUP:g}) la del real, para un mismo producto/labor (3+ filas de cada "
+        "una). Puede ser un presupuesto con otra unidad o precio desactualizado.",
+        tabla_rp,
+        nivel="Info",
+    )
+
+    # 11/12. Cruce con la pestana Comercial
+    if comercial is not None and not comercial.empty:
+        com = comercial.pivot_table(index=["Gestion", "Cultivo"], columns="Metrica", values="Valor", aggfunc="first")
+        cos_calc = superficie_cosechada(df, ["Gestion", "Cultivo"]).set_index(["Gestion", "Cultivo"])
+        cruce = cos_calc.join(com, how="outer")
+        cruce = cruce.rename(columns={"Superficie cosechada (ha)": "Has calculadas (Actual)", "Has": "Has en Comercial"})
+        if "Has en Comercial" in cruce.columns:
+            comp = cruce.dropna(subset=["Has calculadas (Actual)", "Has en Comercial"]).copy()
+            comp["Dif %"] = (comp["Has en Comercial"] - comp["Has calculadas (Actual)"]) / comp["Has calculadas (Actual)"] * 100
+            dif = comp[comp["Dif %"].abs() > UMBRAL_HAS_COMERCIAL * 100].reset_index()
+            tabla_has = dif[["Gestion", "Cultivo", "Has calculadas (Actual)", "Has en Comercial", "Dif %"]].round(1)
+        else:
+            tabla_has = pd.DataFrame()
+        add(
+            "Hectáreas de Comercial distintas a las de Actual",
+            "La fila 'Has' de la pestaña Comercial debería coincidir con las hectáreas de cosecha "
+            f"de Actual (tolerancia {UMBRAL_HAS_COMERCIAL:.0%}). Si no, puede haber cultivos "
+            "cruzados o desactualizados en esa pestaña. El dashboard no usa esa fila, pero sí el "
+            "Rendimiento y el Precio Neto del mismo bloque.",
+            tabla_has,
+        )
+
+        faltan = cos_calc.join(com, how="left").reset_index()
+        for col in ("Rendimiento", "Precio Neto", "Arrendamiento"):
+            if col not in faltan.columns:
+                faltan[col] = np.nan
+        sin_sup = faltan[
+            faltan["Rendimiento"].isna() | (faltan["Rendimiento"] == 0)
+            | faltan["Precio Neto"].isna() | (faltan["Precio Neto"] == 0)
+            | faltan["Arrendamiento"].isna()
+        ]
+        add(
+            "Cultivos con hectáreas pero sin supuestos comerciales completos",
+            "Falta Rendimiento, Precio Neto o Arrendamiento en la pestaña Comercial para esa "
+            "campaña + cultivo: en Resultado su Ingreso Neto queda en 0 o el gasto incompleto.",
+            sin_sup[["Gestion", "Cultivo", "Superficie cosechada (ha)", "Rendimiento", "Precio Neto", "Arrendamiento"]].round(1),
+        )
+
+    return items
