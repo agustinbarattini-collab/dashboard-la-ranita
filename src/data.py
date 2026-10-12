@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 
 import gspread
 import numpy as np
@@ -9,7 +10,10 @@ from google.oauth2.service_account import Credentials
 SPREADSHEET_ID = "1FwPVTMoDBo-Mc5_XAj5ZUiB6pv7AzM6gADDf8s_MLAo"
 TAB_NAME = "Actual"
 TAB_COMERCIAL = "Comercial"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+# Lectura + escritura: solo se escribe la pestana "Revisiones OK" (tildes de la
+# seccion Revision de datos); igual necesita que la cuenta de servicio sea
+# Editora de la planilla, con Lector la lectura sigue andando y escribir da 403.
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # La columna Bloque mezcla lotes reales (ej. "2A1", "1M1-2M2") con 4
 # categorias especiales que no son costeo por lote y todavia no se
@@ -318,6 +322,72 @@ def comercial_lookup(df_comercial: pd.DataFrame) -> dict[tuple[str, str, str], f
     }
 
 
+TAB_REVISIONES = "Revisiones OK"
+
+
+class SinPermisoEscritura(Exception):
+    """La cuenta de servicio solo tiene permiso de lectura sobre la planilla."""
+
+
+def clave_hallazgo(titulo: str, fila: pd.Series, id_cols: list[str]) -> str:
+    """Identificador estable de un hallazgo de la seccion Revision: el titulo
+    del chequeo + los valores de las columnas que lo identifican (no los
+    numeros que cambian de un dia al otro, salvo que formen parte del id)."""
+    return titulo + "|" + "|".join(str(fila[c]) for c in id_cols)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_revisiones_ok() -> frozenset[str]:
+    """Claves de hallazgos ya marcados como revisados (pestana "Revisiones
+    OK"). Si la pestana todavia no existe, no hay ninguno."""
+    sheet = _get_client().open_by_key(SPREADSHEET_ID)
+    try:
+        ws = sheet.worksheet(TAB_REVISIONES)
+    except gspread.WorksheetNotFound:
+        return frozenset()
+    return frozenset(v for v in ws.col_values(1)[1:] if v)
+
+
+def marcar_revisiones(claves: list[tuple[str, str]]) -> None:
+    """Guarda hallazgos como revisados: lista de (clave, titulo del chequeo).
+    Crea la pestana la primera vez. Levanta SinPermisoEscritura si la cuenta
+    de servicio no es Editora de la planilla."""
+    try:
+        sheet = _get_client().open_by_key(SPREADSHEET_ID)
+        try:
+            ws = sheet.worksheet(TAB_REVISIONES)
+        except gspread.WorksheetNotFound:
+            ws = sheet.add_worksheet(TAB_REVISIONES, rows=1000, cols=3)
+            ws.append_row(["Clave", "Chequeo", "Marcado"])
+        ahora = datetime.now().isoformat(timespec="seconds")
+        ya_guardadas = set(ws.col_values(1))
+        nuevas = {c: t for c, t in claves if c not in ya_guardadas}
+        if nuevas:
+            ws.append_rows([[c, t, ahora] for c, t in nuevas.items()], value_input_option="RAW")
+    except gspread.exceptions.APIError as e:
+        if e.response.status_code in (401, 403):
+            raise SinPermisoEscritura from e
+        raise
+    load_revisiones_ok.clear()
+
+
+def desmarcar_revisiones(claves: list[str]) -> None:
+    """Quita hallazgos de la lista de revisados (vuelven a aparecer)."""
+    try:
+        ws = _get_client().open_by_key(SPREADSHEET_ID).worksheet(TAB_REVISIONES)
+        quitar = set(claves)
+        filas = [i for i, v in enumerate(ws.col_values(1), start=1) if i > 1 and v in quitar]
+        for fila in reversed(filas):
+            ws.delete_rows(fila)
+    except gspread.WorksheetNotFound:
+        return
+    except gspread.exceptions.APIError as e:
+        if e.response.status_code in (401, 403):
+            raise SinPermisoEscritura from e
+        raise
+    load_revisiones_ok.clear()
+
+
 # Umbrales de los chequeos de revision (ajustables si dan demasiado ruido).
 UMBRAL_SIEMBRA_VS_COSECHA = 0.15
 UMBRAL_COSTO_HA_LOTE = (0.5, 2.0)
@@ -335,8 +405,10 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
     conocer) y tabla (DataFrame con lo encontrado; vacio = sin hallazgos)."""
     items: list[dict] = []
 
-    def add(titulo: str, detalle: str, tabla: pd.DataFrame, nivel: str = "Revisar") -> None:
-        items.append({"titulo": titulo, "detalle": detalle, "nivel": nivel, "tabla": tabla.reset_index(drop=True)})
+    def add(titulo: str, detalle: str, tabla: pd.DataFrame, nivel: str = "Revisar", id_cols: list[str] | None = None) -> None:
+        tabla = tabla.reset_index(drop=True)
+        claves = [clave_hallazgo(titulo, fila, id_cols or []) for _, fila in tabla.iterrows()] if len(tabla) else []
+        items.append({"titulo": titulo, "detalle": detalle, "nivel": nivel, "tabla": tabla, "claves": claves})
 
     # 1. Nombres de cultivo que no estan en el diccionario
     sin_mapa = df[~df["Cultivo_norm"].isin(CULTIVO_MAP)]
@@ -348,6 +420,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         sin_mapa.groupby(["Cultivo_norm", "Gestion"], as_index=False).agg(
             Filas=("Sup", "size"), Costo_U=("Costo U$", "sum")
         ).rename(columns={"Cultivo_norm": "Cultivo (como está escrito)", "Costo_U": "Costo U$"}),
+        id_cols=["Cultivo (como está escrito)", "Gestion"],
     )
 
     # 2. Filas sin Tipo
@@ -356,6 +429,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         "Filas sin Tipo de gasto",
         "No entran en ninguna categoría del desglose por Tipo.",
         sin_tipo[["Gestion", "Bloque_norm", "Cultivo", "Produc/labor", "Sup", "Costo U$"]],
+        id_cols=["Gestion", "Bloque_norm", "Cultivo", "Produc/labor", "Sup"],
     )
 
     # 3. Filas con Tipo pero sin costo
@@ -364,6 +438,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         "Filas sin costo cargado",
         "Tienen Tipo pero el costo (U$ tot sin IVA) está vacío: no suman nada al costo.",
         sin_costo.groupby(["Gestion", "Bloque_norm", "Cultivo"], as_index=False).agg(Filas=("Tipo", "size")),
+        id_cols=["Gestion", "Bloque_norm", "Cultivo"],
     )
 
     # 4/5. Superficie de cada cultivo en cada lote
@@ -376,6 +451,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         "Normal en pasturas/verdeos; en cultivos de grano conviene cargar la cosecha.",
         sin_cosecha[["Gestion", "Bloque", "Cultivo", "Siembra", "Sup máx", "Superficie", "Fuente"]].round(1),
         nivel="Info",
+        id_cols=["Gestion", "Bloque", "Cultivo"],
     )
 
     ambas = det[(det["Cosecha"] > 0) & (det["Siembra"] > 0)].copy()
@@ -387,6 +463,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         f"{UMBRAL_SIEMBRA_VS_COSECHA:.0%}. Suele ser una siembra cargada dos veces, una resiembra, "
         "o una cosecha incompleta. El dashboard usa las hectáreas de cosecha.",
         desvio[["Gestion", "Bloque", "Cultivo", "Siembra", "Cosecha", "Dif %"]].round(1),
+        id_cols=["Gestion", "Bloque", "Cultivo"],
     )
 
     # 6. Cosecha con filas reales y presupuestadas a la vez
@@ -406,6 +483,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         mixto.rename(columns={"Bloque_norm": "Bloque", "realiz": "Real (ha)", "presup": "Presup (ha)"})[
             ["Gestion", "Bloque", "Cultivo", "Real (ha)", "Presup (ha)", "Suma usada (ha)"]
         ].round(1),
+        id_cols=["Gestion", "Bloque", "Cultivo"],
     )
 
     # 7. Lotes con 2+ cultivos en la misma campana
@@ -422,6 +500,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         "que cada fila de gasto esté cargada con el cultivo correcto.",
         resumen,
         nivel="Info",
+        id_cols=["Gestion", "Bloque"],
     )
 
     # 8. Bloques que no parecen codigo de lote
@@ -433,6 +512,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         raros.groupby(["Gestion", "Bloque_norm"], as_index=False).agg(
             Filas=("Sup", "size"), Cultivos=("Cultivo", lambda s: ", ".join(sorted(set(s)))), Costo_U=("Costo U$", "sum")
         ).rename(columns={"Bloque_norm": "Bloque", "Costo_U": "Costo U$"}).round(0),
+        id_cols=["Gestion", "Bloque"],
     )
 
     # 9. Costo/ha de un lote muy distinto al de su cultivo
@@ -454,6 +534,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         "cultivo en esa campaña (solo cultivos con 4+ lotes). Puede ser un lote parcial o un "
         "error de carga (precio, cantidad o superficie).",
         atipico[["Gestion", "Bloque", "Cultivo", "Costo U$", "Superficie", "Costo/ha", "Mediana del cultivo", "Veces la mediana"]].round(1),
+        id_cols=["Gestion", "Bloque", "Cultivo"],
     )
 
     # 10. Filas con costo/ha muy por encima de otras filas del mismo insumo/labor
@@ -479,6 +560,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         .rename(columns={"Bloque_norm": "Bloque", "RealPresup": "Real/Presup"})
         .sort_values("Veces la mediana", ascending=False)
         .round(1),
+        id_cols=["Gestion", "Bloque", "Cultivo", "Real/Presup", "Tipo", "Produc/labor", "Sup"],
     )
 
     # 10b. Mismo producto: costo/ha real muy distinto al presupuestado
@@ -504,6 +586,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         "una). Puede ser un presupuesto con otra unidad o precio desactualizado.",
         tabla_rp,
         nivel="Info",
+        id_cols=["Producto", "Tipo"],
     )
 
     # 11/12. Cruce con la pestana Comercial
@@ -526,6 +609,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
             "cruzados o desactualizados en esa pestaña. El dashboard no usa esa fila, pero sí el "
             "Rendimiento y el Precio Neto del mismo bloque.",
             tabla_has,
+            id_cols=["Gestion", "Cultivo"],
         )
 
         faltan = cos_calc.join(com, how="left").reset_index()
@@ -542,6 +626,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
             "Falta Rendimiento, Precio Neto o Arrendamiento en la pestaña Comercial para esa "
             "campaña + cultivo: en Resultado su Ingreso Neto queda en 0 o el gasto incompleto.",
             sin_sup[["Gestion", "Cultivo", "Superficie cosechada (ha)", "Rendimiento", "Precio Neto", "Arrendamiento"]].round(1),
+            id_cols=["Gestion", "Cultivo"],
         )
 
     return items

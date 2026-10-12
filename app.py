@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -519,33 +520,97 @@ elif seccion == "3. Revisión de datos":
         "Chequeos automáticos sobre las pestañas Actual y Comercial de la planilla, para "
         "detectar posibles errores de carga. Se recalculan con cada actualización de datos y "
         "no usan los filtros de la izquierda. ⚠️ = probable error a revisar, ℹ️ = algo que el "
-        "dashboard ya interpreta pero conviene conocer, ✅ = sin hallazgos."
+        "dashboard ya interpreta pero conviene conocer, ✅ = sin pendientes. Tildá los puntos "
+        "que ya revisaste y están bien y apretá \"Guardar tildes\": no vuelven a aparecer."
     )
 
     items = data.revisiones(df, data.load_comercial_df())
-    n_revisar = sum(1 for it in items if it["nivel"] == "Revisar" and len(it["tabla"]))
-    n_info = sum(1 for it in items if it["nivel"] == "Info" and len(it["tabla"]))
-    c1, c2, c3 = st.columns(3)
+    ok_sesion: set[str] = st.session_state.setdefault("revisiones_ok_sesion", set())
+    ok = set(data.load_revisiones_ok()) | ok_sesion
+    st.session_state.setdefault("rev_version", 0)
+
+    if st.session_state.get("rev_aviso_permiso"):
+        email_sa = st.secrets["gcp_service_account"].get("client_email", "la cuenta de servicio")
+        st.warning(
+            "Los tildes de esta sesión **no se están guardando en la planilla**: la cuenta de "
+            f"servicio ({email_sa}) solo tiene permiso de lectura y al recargar la página se "
+            "pierden. Para que queden guardados (pestaña nueva \"Revisiones OK\"), compartí la "
+            "planilla con ese mail como **Editor**."
+        )
+
+    mostrar_revisados = st.toggle("Mostrar también los ya revisados", value=False)
+
+    for it in items:
+        it["pendiente"] = [c not in ok for c in it["claves"]]
+    n_revisar = sum(1 for it in items if it["nivel"] == "Revisar" and any(it["pendiente"]))
+    n_info = sum(1 for it in items if it["nivel"] == "Info" and any(it["pendiente"]))
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("⚠️ Para revisar", n_revisar)
     c2.metric("ℹ️ Informativos", n_info)
-    c3.metric("✅ Sin hallazgos", sum(1 for it in items if not len(it["tabla"])))
+    c3.metric("✅ Sin pendientes", sum(1 for it in items if not any(it["pendiente"])))
+    c4.metric("☑️ Puntos marcados", sum(1 for it in items for p in it["pendiente"] if not p))
 
-    def _orden_revision(it: dict) -> int:
-        if not len(it["tabla"]):
+    def _orden_revision(par: tuple[int, dict]) -> int:
+        it = par[1]
+        if not any(it["pendiente"]):
             return 2
         return 0 if it["nivel"] == "Revisar" else 1
 
-    for it in sorted(items, key=_orden_revision):
-        n = len(it["tabla"])
-        icono = "✅" if n == 0 else ("⚠️" if it["nivel"] == "Revisar" else "ℹ️")
-        with st.expander(f"{icono} {it['titulo']} ({n})"):
+    def _guardar_tildes(nuevos: list[tuple[str, str]], quitar: list[str]) -> None:
+        try:
+            if nuevos:
+                data.marcar_revisiones(nuevos)
+            if quitar:
+                data.desmarcar_revisiones(quitar)
+        except data.SinPermisoEscritura:
+            ok_sesion.update(k for k, _ in nuevos)
+            ok_sesion.difference_update(quitar)
+            st.session_state["rev_aviso_permiso"] = True
+        st.session_state["rev_version"] += 1
+        st.rerun()
+
+    for i, it in sorted(enumerate(items), key=_orden_revision):
+        n_total = len(it["claves"])
+        n_pend = sum(it["pendiente"])
+        n_rev = n_total - n_pend
+        icono = "✅" if n_pend == 0 else ("⚠️" if it["nivel"] == "Revisar" else "ℹ️")
+        etiqueta = f"{icono} {it['titulo']} ({n_pend})" + (f" · {n_rev} revisados" if n_rev else "")
+        with st.expander(etiqueta):
             st.caption(it["detalle"].replace("$", "\\$"))
-            if n:
-                st.dataframe(
-                    it["tabla"],
+            if n_total == 0:
+                st.write("Sin hallazgos.")
+                continue
+            if n_pend == 0 and not mostrar_revisados:
+                st.write("Todo revisado. Activá \"Mostrar también los ya revisados\" para verlos o desmarcarlos.")
+                continue
+
+            vista = it["tabla"].copy()
+            vista.insert(0, "Revisado", [not p for p in it["pendiente"]])
+            claves_vista = list(it["claves"])
+            if not mostrar_revisados:
+                pend = np.array(it["pendiente"])
+                vista = vista[pend].reset_index(drop=True)
+                claves_vista = [k for k, p in zip(claves_vista, pend) if p]
+
+            with st.form(f"form_rev_{i}_{st.session_state['rev_version']}"):
+                editado = st.data_editor(
+                    vista,
                     use_container_width=True,
                     hide_index=True,
-                    height=altura_tabla(min(n, 12)),
+                    height=altura_tabla(min(len(vista), 12)),
+                    disabled=[c for c in vista.columns if c != "Revisado"],
+                    column_config={
+                        "Revisado": st.column_config.CheckboxColumn(
+                            "✔ Revisado", help="Tildá los puntos que ya revisaste y están bien: no te los vuelvo a mostrar."
+                        )
+                    },
+                    key=f"rev_{i}_{int(mostrar_revisados)}_{st.session_state['rev_version']}",
                 )
-            else:
-                st.write("Sin hallazgos.")
+                guardar = st.form_submit_button("Guardar tildes")
+            if guardar:
+                antes = list(vista["Revisado"])
+                despues = list(editado["Revisado"])
+                nuevos = [(k, it["titulo"]) for k, a, d in zip(claves_vista, antes, despues) if d and not a]
+                quitar = [k for k, a, d in zip(claves_vista, antes, despues) if a and not d]
+                if nuevos or quitar:
+                    _guardar_tildes(nuevos, quitar)
