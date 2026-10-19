@@ -26,6 +26,11 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # este set.
 BLOQUES_EXCLUIDOS = {"PRES IND", "ALMACEN", "VENTA", "GANADERIA"}
 
+# Cultivos de 2da: se siembran sobre la misma superficie fisica que el cultivo
+# de 1ra, asi que sus hectareas no se suman al total de hectareas del campo
+# (su ingreso y su gasto si entran en los totales).
+CULTIVOS_SIN_AREA_PROPIA = {"Soja 2ª"}
+
 # Unifica variantes de mayusculas/tildes de Cultivo vistas en la planilla.
 # "CN" se deja sin mapear (no se pudo confirmar que cultivo/uso es) para
 # que quede visible en vez de adivinar mal.

@@ -418,9 +418,11 @@ elif seccion == "2. Resultado":
             for c in cultivos_presentes
         }
 
-        # Columna "General": mismo criterio, ponderando por Has entre TODOS
-        # los cultivos seleccionados (no un promedio simple entre cultivos).
-        has_general = sum(has_map.values())
+        # Columna "General": ingresos y gastos de TODOS los cultivos, divididos
+        # por las hectareas fisicas del campo. Los cultivos de 2da (Soja 2ª)
+        # se siembran sobre la misma superficie que el cultivo de 1ra, asi que
+        # sus hectareas NO se suman al denominador (su ingreso y su gasto si).
+        has_general = sum(h for c, h in has_map.items() if c not in data.CULTIVOS_SIN_AREA_PROPIA)
 
         def _general(total_map: dict) -> float | None:
             if not has_general:
@@ -448,7 +450,13 @@ elif seccion == "2. Resultado":
             (general["Margen Neto"] / general["Ingreso Neto"] * 100) if general.get("Ingreso Neto") else None
         )
         general["Rendimiento (t/ha)"] = _general(rend_tot_map)
-        general["Precio Neto (U$/t)"] = _general(precio_tot_map)
+        # Precio neto promedio = ingreso por tonelada (no ponderado por Has:
+        # con el denominador sin Soja 2ª ese promedio saldria inflado).
+        general["Precio Neto (U$/t)"] = (
+            (general["Ingreso Neto"] / general["Rendimiento (t/ha)"])
+            if general.get("Ingreso Neto") is not None and general.get("Rendimiento (t/ha)")
+            else None
+        )
         general["Rinde de indiferencia (t/ha)"] = (
             (general["Gastos totales"] / general["Precio Neto (U$/t)"]) if general.get("Precio Neto (U$/t)") else None
         )
@@ -510,8 +518,9 @@ elif seccion == "2. Resultado":
             "Todos los valores (salvo Has, Rentabilidad, Rendimiento y Rinde/Precio de "
             "indiferencia) están en U\\$/ha cosechada. Gastos totales = suma de los Tipo + "
             "Arrendamiento. Margen Neto = Ingreso Neto − Gastos totales. Rentabilidad = "
-            "Margen Neto / Ingreso Neto. \"General\" pondera todos los cultivos por hectárea "
-            "cosechada (no es un promedio simple entre cultivos)."
+            "Margen Neto / Ingreso Neto. \"General\" suma el ingreso y el gasto de todos los "
+            "cultivos y los divide por las hectáreas físicas: las Has de Soja 2ª no se suman "
+            "(comparten superficie con el cultivo de 1ª), pero su ingreso y su gasto sí entran."
         )
 
 elif seccion == "3. Indirectos":
