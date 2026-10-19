@@ -26,6 +26,11 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # este set.
 BLOQUES_EXCLUIDOS = {"PRES IND", "ALMACEN", "VENTA", "GANADERIA"}
 
+# Pulverizacion terrestre de La Paz (filas reales): si el costo cargado es
+# menor a UMBRAL U$/ha se usa U_HA U$/ha.
+PULV_LA_PAZ_U_HA = 6.6
+PULV_LA_PAZ_UMBRAL_U_HA = 1.0
+
 # Cultivos de 2da: se siembran sobre la misma superficie fisica que el cultivo
 # de 1ra, asi que sus hectareas no se suman al total de hectareas del campo
 # (su ingreso y su gasto si entran en los totales).
@@ -114,6 +119,23 @@ def load_actual_df() -> pd.DataFrame:
     df["Tot"] = _parse_numero_ar(df["Tot"])
     df["Costo $"] = _parse_numero_ar(df["$ total"])
     df["Costo U$"] = _parse_numero_ar(df["U$ tot sin IVA"])
+
+    # Pulverizacion terrestre de La Paz: las filas reales vienen cargadas con
+    # ~0,6-0,8 U$/ha (700-800 $/ha), un valor irreal; se reemplaza por 6,6
+    # U$/ha. Se conserva el costo original para mostrarlo en Revision.
+    df["Costo U$ original"] = df["Costo U$"]
+    ajuste_la_paz = (
+        (df["Produc/labor"].astype(str).str.strip().str.upper() == "PULVERIZACION TERRESTRE")
+        & (df["Contratista"].astype(str).str.strip().str.lower() == "la paz")
+        & (df["RealPresup"] == "realiz")
+        & (df["Sup"] > 0)
+        & (df["Costo U$"] / df["Sup"] < PULV_LA_PAZ_UMBRAL_U_HA)
+    )
+    df["Ajuste La Paz"] = ajuste_la_paz
+    df.loc[ajuste_la_paz, "Costo U$"] = PULV_LA_PAZ_U_HA * df.loc[ajuste_la_paz, "Sup"]
+    tc = _parse_numero_ar(df["T.C."])
+    con_tc = ajuste_la_paz & tc.notna()
+    df.loc[con_tc, "Costo $"] = df.loc[con_tc, "Costo U$"] * tc[con_tc]
 
     # "U$/ha" a veces quedo mal tipeada en la planilla original y Sheets la
     # auto-formateo como fecha (ej. "30-dic-99"); con UNFORMATTED_VALUE eso
@@ -594,6 +616,24 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         id_cols=["Producto", "Tipo"],
     )
 
+    # 10c. Pulverizaciones de La Paz ajustadas
+    aj = df[df["Ajuste La Paz"]]
+    tabla_aj = (
+        aj.groupby(["Gestion", "Bloque_norm", "Cultivo"], as_index=False)
+        .agg(Filas=("Sup", "size"), Has=("Sup", "sum"), Costo_orig=("Costo U$ original", "sum"), Costo_aj=("Costo U$", "sum"))
+        .rename(columns={"Bloque_norm": "Bloque", "Costo_orig": "Costo U$ cargado", "Costo_aj": f"Costo U$ usado ({PULV_LA_PAZ_U_HA:g} U$/ha)"})
+        .round(1)
+    )
+    add(
+        "Pulverización terrestre de La Paz ajustada",
+        f"Filas reales de pulverización terrestre de La Paz cargadas con menos de "
+        f"{PULV_LA_PAZ_UMBRAL_U_HA:g} U$/ha; el dashboard las calcula a {PULV_LA_PAZ_U_HA:g} U$/ha. "
+        "Si corregís el valor en la planilla (por encima de ese umbral), deja de ajustarse.",
+        tabla_aj,
+        nivel="Info",
+        id_cols=["Gestion", "Bloque", "Cultivo"],
+    )
+
     # 11/12. Cruce con la pestana Comercial
     if comercial is not None and not comercial.empty:
         com = comercial.pivot_table(index=["Gestion", "Cultivo"], columns="Metrica", values="Valor", aggfunc="first")
@@ -737,24 +777,33 @@ def asignar_indirectos(
     return asig, no_asig, float(base[col].sum())
 
 
-# Peso relativo del arrendamiento por hectarea segun cultivo, tomado de la
-# planilla de resultados de origen (fila "Arrendamiento"): los cultivos de
-# verano pagan la tarifa completa; cebada, trigo y soja 2ª, la mitad. Los
-# cultivos que no estan aca pagan 1.
-PESO_ARRENDAMIENTO = {"Cebada": 0.5, "Trigo": 0.5, "Soja 2ª": 0.5}
+# Peso relativo por hectarea segun cultivo para repartir los importes de un
+# area de Indirectos (arrendamiento, gerenciamiento, ...) entre los cultivos:
+# los cultivos de verano pagan la tarifa completa; cebada, trigo y soja 2ª, la
+# mitad (comparten la hectarea fisica con otro cultivo). Tomado de la
+# planilla de resultados de origen. Los cultivos que no estan aca pagan 1.
+PESO_HA_FISICA = {"Cebada": 0.5, "Trigo": 0.5, "Soja 2ª": 0.5}
+
+# Areas de Indirectos que se suman como gastos en la seccion Resultado
+# (ademas del arrendamiento), con el nombre exacto de la pestana Indirectos.
+AREAS_GASTO_RESULTADO = ["Gerenciamiento", "Estructura", "Seguros", "Produccion"]
 
 
-def arrendamiento_ha_por_cultivo(df: pd.DataFrame, asig: pd.DataFrame) -> dict[tuple[str, str], float]:
-    """Arrendamiento U$/ha por (Gestion, Cultivo): el total imputado al area
-    "Arrendamiento" en Indirectos (ver asignar_indirectos) se reparte entre
-    los cultivos de la campana segun hectareas cosechadas x peso
-    (PESO_ARRENDAMIENTO), de modo que sum(tasa x ha) = total de la campana.
-    Usa todas las hectareas de la campana (sin filtros de cultivo)."""
-    total = asig[asig["Área"] == "Arrendamiento"].groupby("Gestion")["Imputado"].sum()
+def area_ha_por_cultivo(df: pd.DataFrame, asig: pd.DataFrame, area: str) -> dict[tuple[str, str], float]:
+    """U$/ha por (Gestion, Cultivo) de un area de Indirectos: el total
+    imputado a esa area (ver asignar_indirectos) se reparte entre los cultivos
+    de la campana segun hectareas cosechadas x peso (PESO_HA_FISICA), de modo
+    que sum(tasa x ha) = total de la campana. Usa todas las hectareas de la
+    campana (sin filtros de cultivo)."""
+    total = asig[asig["Área"] == area].groupby("Gestion")["Imputado"].sum()
     sup = superficie_cosechada(df, ["Gestion", "Cultivo"])
-    sup["peso"] = sup["Cultivo"].map(PESO_ARRENDAMIENTO).fillna(1.0)
+    sup["peso"] = sup["Cultivo"].map(PESO_HA_FISICA).fillna(1.0)
     sup["ha_equiv"] = sup["Superficie cosechada (ha)"] * sup["peso"]
     ha_equiv_campana = sup.groupby("Gestion")["ha_equiv"].transform("sum")
     sup["tasa"] = sup["Gestion"].map(total) / ha_equiv_campana * sup["peso"]
     sup = sup.dropna(subset=["tasa"])
     return {(r.Gestion, r.Cultivo): float(r.tasa) for r in sup.itertuples(index=False)}
+
+
+def arrendamiento_ha_por_cultivo(df: pd.DataFrame, asig: pd.DataFrame) -> dict[tuple[str, str], float]:
+    return area_ha_por_cultivo(df, asig, "Arrendamiento")

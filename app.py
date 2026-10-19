@@ -240,6 +240,14 @@ elif seccion == "2. Resultado":
         data.load_indirectos_df(), data.load_indirectos_config(), "U$", ("realiz", "presup"), True
     )
     arr_ind = data.arrendamiento_ha_por_cultivo(df, asig_arr)
+    # Otras areas de Indirectos que se suman como gastos (ver data.AREAS_GASTO_RESULTADO).
+    ind_ha = {a: data.area_ha_por_cultivo(df, asig_arr, a) for a in data.AREAS_GASTO_RESULTADO}
+    areas_faltantes = [a for a in data.AREAS_GASTO_RESULTADO if a not in set(data.load_indirectos_config()["Área"])]
+    if areas_faltantes:
+        st.warning(
+            "En la pestaña Indirectos no encuentro estas áreas, así que no suman como gasto en "
+            f"Resultado: {', '.join(areas_faltantes)}."
+        )
 
     st.caption(
         "Rendimiento, Precio Neto y Flete se precargan desde la pestaña 'Comercial' de la "
@@ -332,7 +340,14 @@ elif seccion == "2. Resultado":
 
         resultado = edited.copy()
         resultado["Ingreso Neto (U$/ha)"] = resultado["Rendimiento (t/ha)"] * resultado["Precio Neto (U$/t)"]
-        resultado["Gastos totales (U$/ha)"] = resultado[col_costo_ha] + resultado["Arrendamiento (U$/ha)"]
+        for area in data.AREAS_GASTO_RESULTADO:
+            resultado[f"{area} (U$/ha)"] = [
+                ind_ha[area].get((g, c), 0.0) for g, c in zip(resultado["Gestion"], resultado["Cultivo"])
+            ]
+        gastos_indirectos = sum(resultado[f"{a} (U$/ha)"] for a in data.AREAS_GASTO_RESULTADO)
+        resultado["Gastos totales (U$/ha)"] = (
+            resultado[col_costo_ha] + resultado["Arrendamiento (U$/ha)"] + gastos_indirectos
+        )
         resultado["Margen Neto (U$/ha)"] = resultado["Ingreso Neto (U$/ha)"] - resultado["Gastos totales (U$/ha)"]
         con_ingreso = resultado["Ingreso Neto (U$/ha)"] != 0
         resultado.loc[con_ingreso, "Rentabilidad (%)"] = (
@@ -377,15 +392,17 @@ elif seccion == "2. Resultado":
             ("Arrendamiento (U$/ha)", "_arrendamiento_tot"),
             ("Rendimiento (t/ha)", "_rend_tot"),
             ("Precio Neto (U$/t)", "_precio_tot"),
-        ]:
+        ] + [(f"{a} (U$/ha)", f"_{a}_tot") for a in data.AREAS_GASTO_RESULTADO]:
             base_cultivo[total_col] = base_cultivo[col] * base_cultivo["Superficie cosechada (ha)"]
-        por_cultivo = base_cultivo.groupby("Cultivo", as_index=False).agg(
-            Has=("Superficie cosechada (ha)", "sum"),
-            _ingreso_tot=("_ingreso_tot", "sum"),
-            _arrendamiento_tot=("_arrendamiento_tot", "sum"),
-            _rend_tot=("_rend_tot", "sum"),
-            _precio_tot=("_precio_tot", "sum"),
-        )
+        agg_spec = {
+            "Has": ("Superficie cosechada (ha)", "sum"),
+            "_ingreso_tot": ("_ingreso_tot", "sum"),
+            "_arrendamiento_tot": ("_arrendamiento_tot", "sum"),
+            "_rend_tot": ("_rend_tot", "sum"),
+            "_precio_tot": ("_precio_tot", "sum"),
+        }
+        agg_spec.update({f"_{a}_tot": (f"_{a}_tot", "sum") for a in data.AREAS_GASTO_RESULTADO})
+        por_cultivo = base_cultivo.groupby("Cultivo", as_index=False).agg(**agg_spec)
 
         cultivos_presentes = sorted(por_cultivo["Cultivo"].unique())
         tipos_presentes = sorted(t for t in gasto_tipo_cultivo["Tipo"].unique() if t)
@@ -414,6 +431,13 @@ elif seccion == "2. Resultado":
         filas["Arrendamiento"] = {c: _tasa(arrend_tot_map, c) for c in cultivos_presentes}
         for c in cultivos_presentes:
             gasto_totales_tot[c] += arrend_tot_map.get(c, 0.0)
+
+        area_tot_maps = {}
+        for area in data.AREAS_GASTO_RESULTADO:
+            area_tot_maps[area] = dict(zip(por_cultivo["Cultivo"], por_cultivo[f"_{area}_tot"]))
+            filas[area] = {c: _tasa(area_tot_maps[area], c) for c in cultivos_presentes}
+            for c in cultivos_presentes:
+                gasto_totales_tot[c] += area_tot_maps[area].get(c, 0.0)
 
         ingreso_tot_map = dict(zip(por_cultivo["Cultivo"], por_cultivo["_ingreso_tot"]))
         filas["Ingreso Neto"] = {c: _tasa(ingreso_tot_map, c) for c in cultivos_presentes}
@@ -467,6 +491,8 @@ elif seccion == "2. Resultado":
             )
             general[tipo] = _general(tot_map)
         general["Arrendamiento"] = _general(arrend_tot_map)
+        for area in data.AREAS_GASTO_RESULTADO:
+            general[area] = _general(area_tot_maps[area])
         general["Ingreso Neto"] = _general(ingreso_tot_map)
         general["Gastos totales"] = _general(gasto_totales_tot)
         general["Margen Neto"] = (
@@ -497,6 +523,7 @@ elif seccion == "2. Resultado":
             + tipos_presentes
             + [
                 "Arrendamiento",
+                *data.AREAS_GASTO_RESULTADO,
                 "Ingreso Neto",
                 "Gastos totales",
                 "Margen Neto",
@@ -545,7 +572,9 @@ elif seccion == "2. Resultado":
         st.caption(
             "Todos los valores (salvo Has, Rentabilidad, Rendimiento y Rinde/Precio de "
             "indiferencia) están en U\\$/ha cosechada. Gastos totales = suma de los Tipo + "
-            "Arrendamiento. Margen Neto = Ingreso Neto − Gastos totales. Rentabilidad = "
+            "Arrendamiento + Gerenciamiento, Estructura, Seguros y Producción (áreas de la sección "
+            "Indirectos, repartidas por cultivo según hectáreas, con cebada, trigo y soja 2ª "
+            "pagando la mitad). Margen Neto = Ingreso Neto − Gastos totales. Rentabilidad = "
             "Margen Neto / Ingreso Neto. \"General\" suma el ingreso y el gasto de todos los "
             "cultivos y los divide por las hectáreas físicas: las Has de Soja 2ª no se suman "
             "(comparten superficie con el cultivo de 1ª), pero su ingreso y su gasto sí entran."
