@@ -735,3 +735,26 @@ def asignar_indirectos(
         .sort_values(["Gestion", "Importe"], ascending=[True, False])
     )
     return asig, no_asig, float(base[col].sum())
+
+
+# Peso relativo del arrendamiento por hectarea segun cultivo, tomado de la
+# planilla de resultados de origen (fila "Arrendamiento"): los cultivos de
+# verano pagan la tarifa completa; cebada, trigo y soja 2ª, la mitad. Los
+# cultivos que no estan aca pagan 1.
+PESO_ARRENDAMIENTO = {"Cebada": 0.5, "Trigo": 0.5, "Soja 2ª": 0.5}
+
+
+def arrendamiento_ha_por_cultivo(df: pd.DataFrame, asig: pd.DataFrame) -> dict[tuple[str, str], float]:
+    """Arrendamiento U$/ha por (Gestion, Cultivo): el total imputado al area
+    "Arrendamiento" en Indirectos (ver asignar_indirectos) se reparte entre
+    los cultivos de la campana segun hectareas cosechadas x peso
+    (PESO_ARRENDAMIENTO), de modo que sum(tasa x ha) = total de la campana.
+    Usa todas las hectareas de la campana (sin filtros de cultivo)."""
+    total = asig[asig["Área"] == "Arrendamiento"].groupby("Gestion")["Imputado"].sum()
+    sup = superficie_cosechada(df, ["Gestion", "Cultivo"])
+    sup["peso"] = sup["Cultivo"].map(PESO_ARRENDAMIENTO).fillna(1.0)
+    sup["ha_equiv"] = sup["Superficie cosechada (ha)"] * sup["peso"]
+    ha_equiv_campana = sup.groupby("Gestion")["ha_equiv"].transform("sum")
+    sup["tasa"] = sup["Gestion"].map(total) / ha_equiv_campana * sup["peso"]
+    sup = sup.dropna(subset=["tasa"])
+    return {(r.Gestion, r.Cultivo): float(r.tasa) for r in sup.itertuples(index=False)}

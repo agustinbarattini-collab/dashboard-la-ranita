@@ -234,13 +234,22 @@ elif seccion == "2. Resultado":
     lookup = data.comercial_lookup(comercial)
     gestiones_comercial = sorted(comercial["Gestion"].unique()) if not comercial.empty else []
 
+    # Arrendamiento: total del area "Arrendamiento" de Indirectos (real +
+    # presupuestado, con la tabla de imputacion), repartido por cultivo.
+    asig_arr, _, _ = data.asignar_indirectos(
+        data.load_indirectos_df(), data.load_indirectos_config(), "U$", ("realiz", "presup"), True
+    )
+    arr_ind = data.arrendamiento_ha_por_cultivo(df, asig_arr)
+
     st.caption(
-        "Rendimiento, Precio Neto, Flete y Arrendamiento se precargan desde la pestaña "
-        f"'Comercial' de la planilla para las campañas que estén cargadas ahí "
-        f"({', '.join(gestiones_comercial) if gestiones_comercial else 'ninguna todavía'}). "
-        "Donde no haya dato en Comercial, completalo a mano. El resto (costo, superficie) "
-        "sale de los datos reales/presupuestados como en Costos. Los valores que edites acá "
-        "son solo de esta sesión, no se guardan en la planilla."
+        "Rendimiento, Precio Neto y Flete se precargan desde la pestaña 'Comercial' de la "
+        f"planilla ({', '.join(gestiones_comercial) if gestiones_comercial else 'sin campañas cargadas'}). "
+        "El Arrendamiento sale del área \"Arrendamiento\" de la sección Indirectos (con la "
+        "tabla de imputación de la pestaña Indirectos): el total de cada campaña se reparte "
+        "por cultivo según hectáreas, con cebada, trigo y soja 2ª pagando la mitad que los "
+        "cultivos de verano. El resto (costo, superficie) sale de los datos reales/"
+        "presupuestados como en Costos. Los valores que edites acá son solo de esta sesión, "
+        "no se guardan en la planilla."
     )
 
     base = data.costo_por_ha_cosechada(
@@ -256,10 +265,19 @@ elif seccion == "2. Resultado":
             st.session_state["supuestos_resultado"] = {}
         supuestos = st.session_state["supuestos_resultado"]
 
-        def _valor_default(gestion: str, cultivo: str, campo: str, metrica_comercial: str) -> float:
-            if (gestion, cultivo) in supuestos:
-                return supuestos[(gestion, cultivo)].get(campo, 0.0)
+        # En la sesion solo se guardan los valores que el usuario cambio a
+        # mano ({(Gestion, Cultivo): {campo: valor}}); lo demas se vuelve a
+        # leer de la planilla en cada carga, asi que sus cambios se ven.
+        def _valor_fuente(gestion: str, cultivo: str, campo: str, metrica_comercial: str) -> float:
+            if campo == "arrendamiento" and (gestion, cultivo) in arr_ind:
+                return arr_ind[(gestion, cultivo)]
             return lookup.get((gestion, cultivo, metrica_comercial), 0.0)
+
+        def _valor_default(gestion: str, cultivo: str, campo: str, metrica_comercial: str) -> float:
+            manual = supuestos.get((gestion, cultivo), {})
+            if campo in manual:
+                return manual[campo]
+            return _valor_fuente(gestion, cultivo, campo, metrica_comercial)
 
         editable = base[["Gestion", "Cultivo", "Superficie cosechada (ha)", col_costo_ha]].copy()
         editable["Rendimiento (t/ha)"] = [
@@ -294,13 +312,23 @@ elif seccion == "2. Resultado":
             key="editor_supuestos_resultado",
         )
 
+        campos_supuesto = {
+            "Rendimiento (t/ha)": ("rend", "Rendimiento"),
+            "Precio Neto (U$/t)": ("precio_neto", "Precio Neto"),
+            "Flete (U$/t)": ("flete", "Flete"),
+            "Arrendamiento (U$/ha)": ("arrendamiento", "Arrendamiento"),
+        }
         for _, fila in edited.iterrows():
-            supuestos[(fila["Gestion"], fila["Cultivo"])] = {
-                "rend": fila["Rendimiento (t/ha)"],
-                "precio_neto": fila["Precio Neto (U$/t)"],
-                "flete": fila["Flete (U$/t)"],
-                "arrendamiento": fila["Arrendamiento (U$/ha)"],
-            }
+            clave = (fila["Gestion"], fila["Cultivo"])
+            manual = {}
+            for columna, (campo, metrica) in campos_supuesto.items():
+                valor = fila[columna]
+                if pd.notna(valor) and abs(valor - _valor_fuente(clave[0], clave[1], campo, metrica)) > 1e-6:
+                    manual[campo] = float(valor)
+            if manual:
+                supuestos[clave] = manual
+            else:
+                supuestos.pop(clave, None)
 
         resultado = edited.copy()
         resultado["Ingreso Neto (U$/ha)"] = resultado["Rendimiento (t/ha)"] * resultado["Precio Neto (U$/t)"]
