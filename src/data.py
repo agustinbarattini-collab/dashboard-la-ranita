@@ -669,7 +669,7 @@ def revisiones(df: pd.DataFrame, comercial: pd.DataFrame) -> list[dict]:
         add(
             "Cultivos con hectáreas pero sin supuestos comerciales completos",
             "Falta Rendimiento, Precio Neto o Arrendamiento en la pestaña Comercial para esa "
-            "campaña + cultivo: en Resultado su Ingreso Neto queda en 0 o el gasto incompleto.",
+            "campaña + cultivo: en Resultado agrícola su Ingreso Neto queda en 0 o el gasto incompleto.",
             sin_sup[["Gestion", "Cultivo", "Superficie cosechada (ha)", "Rendimiento", "Precio Neto", "Arrendamiento"]].round(1),
             id_cols=["Gestion", "Cultivo"],
         )
@@ -807,3 +807,87 @@ def area_ha_por_cultivo(df: pd.DataFrame, asig: pd.DataFrame, area: str) -> dict
 
 def arrendamiento_ha_por_cultivo(df: pd.DataFrame, asig: pd.DataFrame) -> dict[tuple[str, str], float]:
     return area_ha_por_cultivo(df, asig, "Arrendamiento")
+
+
+TAB_MAQUINARIA = "Maquinaria"
+_CAMPANA_MAQ_RE = re.compile(r"^campa[ñn]a\s+(\d{4})\s*-\s*(\d{2,4})$", re.IGNORECASE)
+
+# Codigos de Indirectos que NO cuentan como egreso de maquinaria (en la
+# pestana Indirectos: "Gtos maquinaria LRA").
+EXCLUIR_EGRESO_MAQUINARIA = {"activ"}
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando pestaña Maquinaria...")
+def load_maquinaria_ingresos() -> pd.DataFrame:
+    """Pestana "Maquinaria": uno o mas bloques por campana ("Campaña
+    2025-26" en el titulo), cada uno con una fila de encabezado (Item,
+    Has/tn, Precio/ha, U$ total) y una fila por servicio que presta la
+    maquinaria (Embolsado, Extraccion, Pulverizacion, Mantenimiento, ...)
+    hasta la primera fila sin item. Devuelve una fila por campana + item."""
+    ws = _get_client().open_by_key(SPREADSHEET_ID).worksheet(TAB_MAQUINARIA)
+    values = ws.get_values(value_render_option="UNFORMATTED_VALUE")
+    ancho = max((len(r) for r in values), default=0)
+    values = [list(r) + [""] * (ancho - len(r)) for r in values]
+
+    filas = []
+    for i, row in enumerate(values):
+        for j, celda in enumerate(row):
+            m = _CAMPANA_MAQ_RE.match(str(celda).strip())
+            if not m:
+                continue
+            gestion = f"{m.group(1)[-2:]}/{m.group(2)[-2:]}"
+            for fila in values[i + 2 :]:
+                item = str(fila[j]).strip()
+                if not item:
+                    break
+                filas.append(
+                    {
+                        "Gestion": gestion,
+                        "Item": item,
+                        "Has/tn": _parse_numero_uno(fila[j + 1]),
+                        "Precio": _parse_numero_uno(fila[j + 2]),
+                        "Total planilla": _parse_numero_uno(fila[j + 3]),
+                    }
+                )
+    return pd.DataFrame(filas, columns=["Gestion", "Item", "Has/tn", "Precio", "Total planilla"])
+
+
+def has_fumigadas(df: pd.DataFrame, incluir: tuple[str, ...] = ("realiz", "presup")) -> pd.Series:
+    """Hectareas fumigadas por campana: suma de Sup de las filas de
+    pulverizacion terrestre del contratista La Paz (la maquinaria propia;
+    cada pasada cuenta; la aerea y otros contratistas no)."""
+    t = df[
+        (df["Produc/labor"].astype(str).str.strip().str.upper() == "PULVERIZACION TERRESTRE")
+        & (df["Contratista"].astype(str).str.strip().str.lower() == "la paz")
+        & df["RealPresup"].isin(incluir)
+    ]
+    return t.groupby("Gestion")["Sup"].sum()
+
+
+def ingresos_maquinaria(
+    df: pd.DataFrame, incluir: tuple[str, ...] = ("realiz", "presup")
+) -> pd.DataFrame:
+    """Ingresos de maquinaria por campana e item (U$): Has/tn x Precio de la
+    pestana Maquinaria. Si la pulverizacion no trae hectareas en la planilla,
+    se toman las hectareas fumigadas de la campana (has_fumigadas) y, si no
+    trae precio, PULV_LA_PAZ_U_HA (6,6 U$/ha)."""
+    ing = load_maquinaria_ingresos().copy()
+    if ing.empty:
+        return ing.assign(Origen=pd.Series(dtype=str), Total=pd.Series(dtype=float))
+    fum = has_fumigadas(df, incluir)
+    es_pulv = ing["Item"].str.lower().str.contains("pulveriz")
+    sin_has = es_pulv & (ing["Has/tn"].isna() | (ing["Has/tn"] == 0))
+    ing.loc[sin_has, "Has/tn"] = ing.loc[sin_has, "Gestion"].map(fum).fillna(0.0)
+    ing.loc[es_pulv & ing["Precio"].isna(), "Precio"] = PULV_LA_PAZ_U_HA
+    producto = ing["Has/tn"] * ing["Precio"]
+    ing["Total"] = producto.fillna(ing["Total planilla"]).fillna(0.0)
+    ing["Origen"] = np.where(sin_has, "Has fumigadas de la base", "Planilla")
+    return ing
+
+
+def egresos_maquinaria(asig: pd.DataFrame) -> pd.DataFrame:
+    """Egresos de maquinaria por campana y codigo: lo imputado al area
+    Maquinaria en Indirectos (ver asignar_indirectos) sin los codigos de
+    EXCLUIR_EGRESO_MAQUINARIA."""
+    m = asig[(asig["Área"] == "Maquinaria") & ~asig["Codigo"].isin(EXCLUIR_EGRESO_MAQUINARIA)]
+    return m.groupby(["Gestion", "Codigo", "Detalle"], as_index=False).agg(Pct=("Pct", "first"), Egreso=("Imputado", "sum"))

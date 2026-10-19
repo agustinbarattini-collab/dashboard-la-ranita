@@ -74,7 +74,7 @@ st.set_page_config(page_title="La Ranita · Dashboard", layout="wide", page_icon
 auth.require_login()
 
 st.sidebar.title("🐸 La Ranita")
-seccion = st.sidebar.radio("Sección", ["1. Costos", "2. Resultado", "3. Indirectos", "4. Revisión de datos"])
+seccion = st.sidebar.radio("Sección", ["1. Costos", "2. Resultado agrícola", "3. Resultado maquinaria", "4. Indirectos", "5. Revisión de datos"])
 
 if st.sidebar.button("↻ Actualizar datos"):
     st.cache_data.clear()
@@ -227,8 +227,8 @@ if seccion == "1. Costos":
                     height=altura_tabla(pivot_costo_c.shape[0] + 1),
                 )
 
-elif seccion == "2. Resultado":
-    st.title("Resultado")
+elif seccion == "2. Resultado agrícola":
+    st.title("Resultado agrícola")
 
     comercial = data.load_comercial_df()
     lookup = data.comercial_lookup(comercial)
@@ -580,7 +580,136 @@ elif seccion == "2. Resultado":
             "(comparten superficie con el cultivo de 1ª), pero su ingreso y su gasto sí entran."
         )
 
-elif seccion == "3. Indirectos":
+elif seccion == "3. Resultado maquinaria":
+    st.title("Resultado maquinaria")
+    st.caption(
+        "Ingresos: servicios que presta la maquinaria, de la pestaña \"Maquinaria\" de la planilla "
+        "(hectáreas o toneladas × precio). En Pulverización, si la planilla no trae hectáreas, se "
+        "usan las hectáreas fumigadas de la campaña (pulverización terrestre de La Paz en la base) × el "
+        "precio de la planilla (6,6 U$/ha). Egresos: lo imputado al área Maquinaria en Indirectos "
+        "(con la tabla de imputación), sin \"Gtos maquinaria\". Todo en U\\$. Usa el filtro de "
+        "Campaña de la izquierda."
+    )
+
+    modo_maq = st.radio(
+        "Importes a considerar",
+        ["Real + presupuestado", "Solo real", "Solo presupuestado"],
+        horizontal=True,
+        key="modo_maq",
+        help="Afecta a las hectáreas fumigadas y a los egresos de Indirectos.",
+    )
+    incluir_maq = {
+        "Real + presupuestado": ("realiz", "presup"),
+        "Solo real": ("realiz",),
+        "Solo presupuestado": ("presup",),
+    }[modo_maq]
+
+    ingresos = data.ingresos_maquinaria(df, incluir_maq)
+    asig_maq, _, _ = data.asignar_indirectos(
+        data.load_indirectos_df(), data.load_indirectos_config(), "U$", incluir_maq, True
+    )
+    egresos = data.egresos_maquinaria(asig_maq)
+    ingresos = ingresos[ingresos["Gestion"].isin(gestiones_sel)]
+    egresos = egresos[egresos["Gestion"].isin(gestiones_sel)]
+
+    sin_ingreso = [g for g in gestiones_sel if g not in set(ingresos["Gestion"])]
+    if sin_ingreso:
+        st.info(
+            "No hay ingresos de maquinaria cargados en la pestaña Maquinaria para: "
+            f"{', '.join(sin_ingreso)}. Para esa campaña solo se ven egresos."
+        )
+
+    total_ing = ingresos["Total"].sum()
+    total_egr = egresos["Egreso"].sum()
+    resultado_maq = total_ing - total_egr
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ingresos (U$)", f"{total_ing:,.0f}")
+    c2.metric("Egresos (U$)", f"{total_egr:,.0f}")
+    c3.metric("Resultado (U$)", f"{resultado_maq:,.0f}")
+    c4.metric("Resultado / Ingresos", f"{resultado_maq / total_ing:.1%}" if total_ing else "—")
+
+    st.subheader("Resumen por campaña (U$)")
+    campanas_maq = [g for g in gestiones_sel if g in set(ingresos["Gestion"]) | set(egresos["Gestion"])]
+    if campanas_maq:
+        ing_g = ingresos.groupby("Gestion")["Total"].sum().reindex(campanas_maq).fillna(0.0)
+        egr_g = egresos.groupby("Gestion")["Egreso"].sum().reindex(campanas_maq).fillna(0.0)
+        resumen_maq = pd.DataFrame({"Ingresos": ing_g, "Egresos": egr_g, "Resultado": ing_g - egr_g}).T
+        if len(campanas_maq) > 1:
+            resumen_maq["Total"] = resumen_maq.sum(axis=1)
+        resumen_maq = resumen_maq.reset_index().rename(columns={"index": "Concepto"})
+        st.dataframe(
+            resumen_maq.style.format({c: "{:,.0f}" for c in resumen_maq.columns if c != "Concepto"})
+            .apply(lambda f: ["font-weight: bold; background-color: #e0e0e0"] * len(f) if f["Concepto"] == "Resultado" else [""] * len(f), axis=1),
+            use_container_width=True,
+            hide_index=True,
+            height=altura_tabla(len(resumen_maq)),
+        )
+
+    st.subheader("Ingresos por ítem (U$)")
+    if ingresos.empty:
+        st.info("No hay ingresos de maquinaria para el filtro actual.")
+    else:
+        det_ing = ingresos[["Gestion", "Item", "Has/tn", "Precio", "Total", "Origen"]].rename(
+            columns={"Gestion": "Campaña", "Total": "U$ total", "Has/tn": "Has / tn"}
+        )
+        st.dataframe(
+            det_ing.style.format({"Has / tn": "{:,.0f}", "Precio": "{:,.2f}", "U$ total": "{:,.0f}"}, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+            height=altura_tabla(len(det_ing)),
+        )
+
+    st.subheader("Egresos por concepto (U$)")
+    if egresos.empty:
+        st.info("No hay egresos imputados a Maquinaria para el filtro actual.")
+    else:
+        det_egr = egresos.pivot_table(
+            index=["Detalle", "Codigo", "Pct"], columns="Gestion", values="Egreso", aggfunc="sum"
+        ).reindex(columns=[g for g in gestiones_sel if g in set(egresos["Gestion"])]).fillna(0.0)
+        if det_egr.shape[1] > 1:
+            det_egr["Total"] = det_egr.sum(axis=1)
+        det_egr = det_egr.reset_index().rename(columns={"Codigo": "Código", "Pct": "% a Maquinaria"})
+        det_egr = det_egr.sort_values(det_egr.columns[-1], ascending=False)
+        importes_egr = [c for c in det_egr.columns if c not in ("Detalle", "Código", "% a Maquinaria")]
+        st.dataframe(
+            det_egr.style.format({**{c: "{:,.0f}" for c in importes_egr}, "% a Maquinaria": "{:.0%}"}),
+            use_container_width=True,
+            hide_index=True,
+            height=altura_tabla(len(det_egr)),
+        )
+
+    col_pie_i, col_pie_e = st.columns(2)
+    with col_pie_i:
+        st.subheader("Ingresos")
+        pie_ing = ingresos.groupby("Item", as_index=False)["Total"].sum()
+        pie_ing = pie_ing[pie_ing["Total"] > 0]
+        if pie_ing.empty:
+            st.info("Sin ingresos para graficar.")
+        else:
+            fig_pie_i = px.pie(pie_ing, names="Item", values="Total", hole=0.35)
+            fig_pie_i.update_traces(
+                textinfo="percent+label",
+                hovertemplate="%{label}: U$ %{value:,.0f} (%{percent})<extra></extra>",
+            )
+            st.plotly_chart(fig_pie_i, use_container_width=True)
+    with col_pie_e:
+        st.subheader("Egresos")
+        pie_egr = egresos.groupby("Detalle", as_index=False)["Egreso"].sum()
+        negativos = pie_egr[pie_egr["Egreso"] <= 0]
+        pie_egr = pie_egr[pie_egr["Egreso"] > 0]
+        if pie_egr.empty:
+            st.info("Sin egresos para graficar.")
+        else:
+            fig_pie_e = px.pie(pie_egr, names="Detalle", values="Egreso", hole=0.35)
+            fig_pie_e.update_traces(
+                textinfo="percent+label",
+                hovertemplate="%{label}: U$ %{value:,.0f} (%{percent})<extra></extra>",
+            )
+            st.plotly_chart(fig_pie_e, use_container_width=True)
+            if len(negativos):
+                st.caption("Conceptos con importe cero o negativo, omitidos del gráfico: " + ", ".join(negativos["Detalle"]))
+
+elif seccion == "4. Indirectos":
     st.title("Indirectos")
     st.caption(
         "Filas de la base con Produc/labor = \"indirecto\" (bloques PRES IND y Ganadería), "
@@ -725,7 +854,7 @@ elif seccion == "3. Indirectos":
             height=altura_tabla(min(len(no_asig), 12)),
         )
 
-elif seccion == "4. Revisión de datos":
+elif seccion == "5. Revisión de datos":
     st.title("Revisión de datos")
     st.caption(
         "Chequeos automáticos sobre las pestañas Actual y Comercial de la planilla, para "
